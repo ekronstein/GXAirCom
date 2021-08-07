@@ -19,7 +19,8 @@
 /* Debug */
 #define MAC_debug_mode				0
 //#define MAC_debug_mode				100
-#define RX_DEBUG 0
+#define RX_DEBUG 1
+#define TX_DEBUG 0
 
 
 //define the pins used by the LoRa transceiver module
@@ -109,6 +110,7 @@
 #define FSK_TIME 2000
 
 #define LEGACY_RANGE 50
+#define LEGACY_SEND_TIME 50
 #define LEGACY_8682_BEGIN		400
 #define LEGACY_8682_END			800
 #define LEGACY_8684_BEGIN		900
@@ -117,17 +119,6 @@
 #define MODE_LORA 1
 #define MODE_FSK_8682 2
 #define MODE_FSK_8684 3
-
-#define RF_MODE_FANET_RX_TX 0
-#define RF_MODE_FANET_RX_TX_LEG_TX 1
-#define RF_MODE_FANET_RX_TX_LEG_RX_TX 2
-#define RF_MODE_FANET_TX_LEG_RX_TX 3
-#define RF_MODE_FANET_TX_LEG_RX 4
-#define RF_MODE_LEG_RX_TX 5
-#define RF_MODE_LEG_RX 6
-#define RF_MODE_FANET_RX_TX_LEG_RX 7
-
-
 
 
 //#include "main.h"
@@ -189,6 +180,15 @@ public:
 class FanetMac
 {
 private:
+	struct rfModeBits
+	{
+			unsigned FntRx:1, FntTx:1, LegRx:1, LegTx:1, b4:1, b5:1, b6:1, b7:1;
+	};
+	union uRfMode
+	{
+			rfModeBits bits;
+			uint8_t mode;
+	};
 	TimerObject myTimer;
 	MacFifo tx_fifo;
 	MacFifo rx_fifo;
@@ -224,7 +224,6 @@ private:
 
 	bool isNeighbor(MacAddr addr);
 	//int16_t checkLegacyPaket(void *legacy_pkt, ufo_t *this_aircraft, ufo_t *fop);
-	uint8_t _RfMode;	
 	uint8_t _actMode = 0;
 	//bool _fskMode;
 	LoRaClass radio;
@@ -242,7 +241,8 @@ public:
   float lon = 0;
   float geoidAlt = 0;
   bool bPPS = false;
-	bool bFanetTxEn = false;
+	bool bHasGPS = true;
+	uRfMode _RfMode;	
 	uint16_t txFntCount = 0;
 	uint16_t rxFntCount = 0;
 	uint16_t txLegCount = 0;
@@ -253,7 +253,7 @@ public:
 
 	bool begin(int8_t sck, int8_t miso, int8_t mosi, int8_t ss,int reset, int dio0,Fapp &app,long frequency,uint8_t level,uint8_t radioChip);
 	void end();
-	void handle() { myTimer.Update(); }
+	void handle() { radio.run(); myTimer.Update();  }
 
 	bool txQueueDepleted(void) { return (tx_fifo.size() == 0); }
 	bool txQueueHasFreeSlots(void){ return (tx_fifo.size() < MAC_FIFO_SIZE); }

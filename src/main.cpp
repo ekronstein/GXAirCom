@@ -30,9 +30,14 @@
 #include "gxUpdater.h"
 #include <AceButton.h>
 #include "../lib/FANETLORA/Legacy/Legacy.h"
+//#include <esp_task_wdt.h>
 
 
 //#define TEST
+
+#define TINY_GSM_RX_BUFFER 1024
+
+#define WDT_TIMEOUT 15
 
 #ifdef GSM_MODULE
 
@@ -105,6 +110,10 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &i2cOLED);
 #include <toneAC.h>
 
 #define USE_BEEPER
+
+#ifdef SENDFLARMDIRECT
+  uint8_t flarmCount = 0;
+#endif
 
 char nmeaBuffer[100];
 MicroNMEA nmea(nmeaBuffer, sizeof(nmeaBuffer));
@@ -289,6 +298,8 @@ void taskEInk(void *pvParameters);
 #endif
 #ifdef GSM_MODULE
 void taskGsm(void *pvParameters);
+//void readSMS();
+//void sendStatus();
 #endif
 #ifdef OLED
 void startOLED();
@@ -590,12 +601,19 @@ void drawWifiStat(int wifiStat)
 void setAllTime(tm &timeinfo){
   tmElements_t tm;          // a cache of time elements
   //fill time-structure
-  tm.Year = timeinfo.tm_year+1900 - 1970;
+  
+  //tm.Year = timeinfo.tm_year+1900 - 1970;
+  //if( timeinfo.tm_year > 99){
+  tm.Year = uint8_t(timeinfo.tm_year + 1900 - 1970);
+  //}else{
+  //  tm.Year = timeinfo.tm_year + 30;    
+  //}      
   tm.Month = timeinfo.tm_mon+1;
   tm.Day = timeinfo.tm_mday;
   tm.Hour = timeinfo.tm_hour;
   tm.Minute = timeinfo.tm_min;
   tm.Second = timeinfo.tm_sec;
+  //log_i("y1=%d,y=%d,m=%d,d=%d,h=%d,m=%d,s=%d",timeinfo.tm_year,tm.Year,tm.Month,tm.Day,tm.Hour,tm.Minute,tm.Second);
   time_t t =  makeTime(tm);  
   setTime(t); //set time of timelib
   timeval epoch = {(int32_t)t, 0};
@@ -711,9 +729,11 @@ void sendFlarmData(uint32_t tAct){
   if (timeOver(tAct,tSend,FLARM_UPDATE_RATE)){
     tSend = tAct;
     if (status.GPS_Fix){
+      #ifndef SENDFLARMDIRECT
       Fanet2FlarmData(&fanet._myData,&myFlarmData);
       for (int i = 0; i < MAXNEIGHBOURS; i++){
-        if (fanet.neighbours[i].devId){
+        //if ((fanet.neighbours[i].devId) && (fanet.neighbours[i].type == 0x11)){ //we have a ID an we are flying !!
+        if (fanet.neighbours[i].devId){ //we have a ID an we are flying !!
           tFanetData.aircraftType = fanet.neighbours[i].aircraftType;
           tFanetData.altitude = fanet.neighbours[i].altitude;
           tFanetData.climb = fanet.neighbours[i].climb;
@@ -729,11 +749,23 @@ void sendFlarmData(uint32_t tAct){
           countNeighbours++;    
         }
       }
-      flarm.GPSState = FLARM_GPS_FIX3d_AIR;
+      #endif
+
+      if (status.flying){
+        flarm.GPSState = FLARM_GPS_FIX3d_AIR;
+      }else{
+        flarm.GPSState = FLARM_GPS_FIX3d_GROUND;
+      }      
     }else{
       flarm.GPSState = FLARM_NO_GPS;
     }
-    flarm.neighbors = countNeighbours;
+    #ifdef SENDFLARMDIRECT
+      flarm.neighbors = flarmCount;
+      flarmCount = 0;
+    #else
+      flarm.neighbors = countNeighbours;
+    #endif
+    
     char sDataPort[MAXSTRING];
     int iLen = flarm.writeDataPort(&sDataPort[0],sizeof(sDataPort));
     sendData2Client(&sDataPort[0],iLen);
@@ -890,7 +922,7 @@ void printGSData(uint32_t tAct){
 
 
   //get next index
-  for (int i = 0;i <= MAXNEIGHBOURS;i++){
+  for (int i = 0;i < MAXNEIGHBOURS;i++){
     if (fanet.neighbours[index].devId) break;
     index ++;
     if (index >= MAXNEIGHBOURS) index = 0;
@@ -1482,7 +1514,7 @@ void printSettings(){
   
   
   log_i("AirWhere-Livetracking=%d",setting.awLiveTracking);
-  log_i("OGN-Livetracking=%d",setting.OGNLiveTracking);
+  log_i("OGN-Livetracking=%d",setting.OGNLiveTracking.mode);
   log_i("Traccar-Livetracking=%d",setting.traccarLiveTracking);
   log_i("Traccar-Address=%s",setting.TraccarSrv.c_str());
   log_i("RF-Mode=%d",setting.RFMode);
@@ -1637,6 +1669,9 @@ void setup() {
   
   // put your setup code here, to run once:  
   //Serial.begin(57600);
+  //esp_task_wdt_init(WDT_TIMEOUT, true); //enable panic so ESP32 restarts
+  //esp_task_wdt_add(NULL); //add current thread to WDT watch
+
   Serial.begin(115200);
 
   status.bPowerOff = false;
@@ -1646,9 +1681,26 @@ void setup() {
   status.bTimeOk = false;
   status.modemstatus = MODEM_DISCONNECTED;
   command.ConfigGPS = 0;
-  status.bHasGPS = true; //we have our own GPS-Module
+  status.bHasGPS = false;
+  fanet.setGPS(false);
   status.tRestart = 0;
 
+
+  /*
+  String sTest = "+CMGL: 1,\"REC READ\",\"00436509946563\",,\"21/06/25,19:59:20+00\"";
+  String sRet = "";
+  String sNumber = "";
+  int32_t pos = getStringValue(sTest,String("+CMGL: "),String(",\""),0,&sRet);
+  if (pos >= 0){     
+    uint8_t index = atoi(sRet.c_str());
+    pos += 2;
+    log_i("pos=%d",pos);
+    pos = getStringValue(sTest,String("\",\""),String("\""),pos,&sNumber);
+    if (pos >= 0){
+      log_i("index=%d,number=%s",index,sNumber.c_str());
+    }      
+  }
+  */
   //log_e("error");
 
   /*
@@ -1715,9 +1767,9 @@ void setup() {
     log_i("only Air-Mode compiled");
     setting.Mode = MODE_AIR_MODULE;
   #endif
-  status.bHasGSM = false;
+  status.gsm.bHasGSM = false;
   #ifdef GSM_MODULE
-    status.bHasGSM = true;
+    status.gsm.bHasGSM = true;
   #endif
 
   //esp_wifi_stop();
@@ -2112,9 +2164,8 @@ xOutputMutex = xSemaphoreCreateMutex();
 #ifdef GSM_MODULE
 
 bool connectGPRS(){
-  log_i("Connecting to internet");
+  log_i("Connecting to internet apn=%s,user=%s,pw=%s",setting.gsm.apn.c_str(),setting.gsm.user.c_str(),setting.gsm.pwd.c_str());
   return modem.gprsConnect(setting.gsm.apn.c_str(), setting.gsm.user.c_str(), setting.gsm.pwd.c_str());
-
 }
 
 
@@ -2133,17 +2184,30 @@ bool initModem(){
   if (!modem.restart()) return false;
   #ifdef TINY_GSM_MODEM_SIM7000
     modem.disableGPS();
-    //log_i("set NetworkMode to LTE");
-    //modem.setNetworkMode(38); //set mode to LTE
+    log_i("set NetworkMode to %d",setting.gsm.NetworkMode);
+   modem.setNetworkMode(setting.gsm.NetworkMode); //set mode
     //log_i("set preferredMode to CAT-M and NB-IoT");
-    //modem.setPreferredMode(3); //set to CAT-M and NB-IoT
+    //log_i("set NB-IOT");
+    //modem.setPreferredMode(2); //set to NB-IoT
   #endif
   modem.sleepEnable(false); //set sleepmode off
+  modem.sendAT(GF("+CMGF=1"));
+  modem.waitResponse();
   log_i("Waiting for network...");
-  if (!modem.waitForNetwork(120000L)) return false;
-  log_i("signal quality %d",modem.getSignalQuality());
+  if (!modem.waitForNetwork(600000L)) return false;
+  status.gsm.SignalQuality = modem.getSignalQuality();
+  //log_i("signal quality %d",status.gsm.SignalQuality);
+  status.gsm.sOperator = modem.getOperator();
+  //log_i("operator=%s",status.gsm.sOperator.c_str());
+  bool bAutoreport;
+  if (modem.getNetworkSystemMode(bAutoreport,status.gsm.networkstat)){        
+    //log_i("network system mode %d",status.gsm.networkstat);
+  }else{
+    log_e("can't get Networksystemmode");
+  }
   if (!connectGPRS()) return false;
-  log_i("connected successfully");
+  status.myIP = modem.getLocalIP();
+  log_i("connected successfully IP:%s",status.myIP.c_str());
   return true;
 }
 
@@ -2179,37 +2243,53 @@ void taskGsm(void *pvParameters){
   #endif
   */
   GsmSerial.begin(115200,SERIAL_8N1,PinGsmRx,PinGsmTx,false); //baud, config, rx, tx, invert
-  const TickType_t xDelay = 60000 / portTICK_PERIOD_MS;   //only every 60sek.
-  TickType_t xLastWakeTime = xTaskGetTickCount (); //get actual tick-count
+  //const TickType_t xDelay = 60000 / portTICK_PERIOD_MS;   //only every 60sek.
+  //TickType_t xLastWakeTime = xTaskGetTickCount (); //get actual tick-count
   //bool status;
+  uint32_t tAct = millis();
+  static uint32_t tCheckConn = millis() - GSM_CHECK_TIME_CON; //check every 60sec.
+  static uint32_t tCheckSms = millis() - GSM_CHECK_TIME_SMS;
+  // Set preferred message format to text mode
+
   while(1){
-    xSemaphoreTake( xGsmMutex, portMAX_DELAY );
-    if (modem.isGprsConnected()){
-      status.modemstatus = MODEM_CONNECTED;
-      xLastWakeTime = xTaskGetTickCount (); //get actual tick-count
-      status.GSMSignalQuality = modem.getSignalQuality();
-      /*
-      modem.sendAT(GF("+CNSMOD?"));      
-      String res;
-      if (modem.waitResponse(GF("+CNSMOD:")) == 1){
-        modem.streamSkipUntil(',');  // Skip context id
-        String res = modem.stream.readStringUntil('\r');
-        log_i("network system mode %s",res.c_str());
-      }
-      */
-    }else{
-      status.modemstatus = MODEM_CONNECTING;
-      if (modem.isNetworkConnected()){  
-        connectGPRS();
+    tAct = millis();
+    if (timeOver(tAct,tCheckConn,GSM_CHECK_TIME_CON)){
+      tCheckConn = tAct;
+      //log_i("%d Check GSM-Connection",tCheckConn);
+      xSemaphoreTake( xGsmMutex, portMAX_DELAY );
+      if (modem.isGprsConnected()){
+        status.modemstatus = MODEM_CONNECTED;
+        //xLastWakeTime = xTaskGetTickCount (); //get actual tick-count
+        tCheckConn = millis();
+        status.gsm.SignalQuality = modem.getSignalQuality();
+        bool bAutoreport;
+        if (modem.getNetworkSystemMode(bAutoreport,status.gsm.networkstat)){        
+          //log_i("network system mode %d",status.gsm.networkstat);
+        }else{
+          log_e("can't get Networksystemmode");
+        }
+        
       }else{
-        initModem(); //init modem
-      }
+        status.modemstatus = MODEM_CONNECTING;
+        if (modem.isNetworkConnected()){  
+          connectGPRS();
+        }else{
+          initModem(); //init modem
+        }
+      }          
+      xSemaphoreGive( xGsmMutex );
     }
-    xSemaphoreGive( xGsmMutex );
+    /*
+    if (timeOver(tAct,tCheckSms,GSM_CHECK_TIME_SMS)){
+      tCheckSms = tAct;
+      readSMS();
+    }
+    */
     //if ((WebUpdateRunning) || (bGsmOff)) break;
     if (bGsmOff) break; //we need GSM for webupdate
     //delay(1);
-    vTaskDelayUntil( &xLastWakeTime, xDelay); //wait until next cycle
+    delay(1000);
+    //vTaskDelayUntil( &xLastWakeTime, xDelay); //wait until next cycle
   }
   //modem.stop(15000L);
   status.modemstatus = MODEM_DISCONNECTED;
@@ -2565,15 +2645,17 @@ void taskBaro(void *pvParameters){
         bInitCalib = true;
       }
       if (command.CalibAcc == 11){
-        if (baro.calibrate(bInitCalib)){
-          status.calibAccStat = 0;
-          command.CalibAcc = 2; //calibrating finished --> reboot
-          delay(2000);
-          esp_restart();
-          
+        if (baro.calibrate(bInitCalib,status.calibAccStat)){
+          bInitCalib = false;
+          if (status.calibAccStat == 6){
+            status.calibAccStat = 0;
+            command.CalibAcc = 2; //calibrating finished --> reboot
+            delay(2000);
+            esp_restart();
+          }else{
+            status.calibAccStat++;
+          }          
         }
-        bInitCalib = false;
-        status.calibAccStat++;
         command.CalibAcc = 10;
       }
         /*
@@ -2631,8 +2713,9 @@ void taskBaro(void *pvParameters){
 #endif
 
 void loop() {
-  // put your main code here, to run repeatedly:
-  //delay(1000); //wait 1second
+  //log_i("Resetting WDT...");
+  //esp_task_wdt_reset();  
+  //delay(10000);
 }
 
 void taskMemory(void *pvParameters) {
@@ -2819,8 +2902,8 @@ void printWeather(uint32_t tAct){
     drawWifiStat(status.wifiStat);
     drawBluetoothstat(101,0);
     drawBatt(111, 0,(status.BattCharging) ? 255 : status.BattPerc);
-    if (status.bHasGSM){
-      drawSignal(60,0,status.GSMSignalQuality);
+    if (status.gsm.bHasGSM){
+      drawSignal(60,0,status.gsm.SignalQuality);
     }    
     display.setTextSize(3); //set Textsize
     display.setCursor(0,21);
@@ -3356,9 +3439,30 @@ void checkSystemCmd(char *ch_str){
       esp_restart();
     }
   }
+  if (line.indexOf("#SYC RFMODE?") >= 0){
+    //log_i("sending 2 client");
+    add2OutputString("#SYC RFMODE=" + String(setting.RFMode) + "\r\n");
+  }
+  iPos = getStringValue(line,"#SYC RFMODE=","\r",0,&sRet);
+  if (iPos >= 0){
+    uint8_t u8 = atoi(sRet.c_str());
+    u8 = constrain(u8,0,15);
+    add2OutputString("#SYC OK\r\n");
+    if (u8 != setting.RFMode){
+      setting.RFMode = u8;
+      write_RFMode();
+      delay(500); //we have to restart in case, the mode is changed
+      log_e("ESP Restarting !");
+      esp_restart();
+    }
+  }
   if (line.indexOf("#SYC FNTPWR?") >= 0){
     //log_i("sending 2 client");
     add2OutputString("#SYC FNTPWR=" + String(setting.LoraPower) + "\r\n");
+  }
+  if (line.indexOf("#SYC DOUPDATE") >= 0){
+    status.updateState = 50; //check for Update automatic
+    add2OutputString("Check for update\r\n");
   }
   iPos = getStringValue(line,"#SYC FNTPWR=","\r",0,&sRet);
   if (iPos >= 0){
@@ -3435,7 +3539,7 @@ void readGPS(){
   static uint16_t recBufferIndex = 0;
   static uint32_t tGpsOk = millis();
   
-  if (sNmeaIn.length() > 0){
+  if (sNmeaIn.length() > 0){ //String received by Bluetooth
     if (!status.bHasGPS){
       char * cstr = new char [sNmeaIn.length()+1];
       strcpy (cstr, sNmeaIn.c_str());
@@ -3457,36 +3561,49 @@ void readGPS(){
         }
         i++;
       }
-      delete cstr; //delete allocated String
       if (setting.outputGPS) sendData2Client(cstr,sNmeaIn.length()); //sendData2Client(sNmeaIn);
+      delete cstr; //delete allocated String
       sNmeaIn = "";
     }else{
       sNmeaIn = ""; //we have a gps --> don't take data from external GPS
     }
   }
-  while(NMeaSerial.available()){
-    if (recBufferIndex >= 255) recBufferIndex = 0; //Buffer overrun
-    lineBuffer[recBufferIndex] = NMeaSerial.read();
-    //log_i("GPS %c",lineBuffer[recBufferIndex]);
-    nmea.process(lineBuffer[recBufferIndex]);
-    if (lineBuffer[recBufferIndex] == '\n'){
-      lineBuffer[recBufferIndex] = '\r';
-      recBufferIndex++;
-      lineBuffer[recBufferIndex] = '\n';
-      recBufferIndex++;
-      lineBuffer[recBufferIndex] = 0; //zero-termination
-      if (setting.outputGPS) sendData2Client(lineBuffer,recBufferIndex);
-      recBufferIndex = 0;
-      tGpsOk = millis();
-      status.bHasGPS = true;
-    }else{
-      if (lineBuffer[recBufferIndex] != '\r'){
+  if (setting.Mode == MODE_AIR_MODULE){
+    //in Ground-Station-Mode you have to setup GPS-Position manually
+    while(NMeaSerial.available()){
+      if (recBufferIndex >= 255) recBufferIndex = 0; //Buffer overrun
+      lineBuffer[recBufferIndex] = NMeaSerial.read();
+      //log_i("GPS %c",lineBuffer[recBufferIndex]);
+      nmea.process(lineBuffer[recBufferIndex]);
+      if (lineBuffer[recBufferIndex] == '\n'){
+        lineBuffer[recBufferIndex] = '\r';
         recBufferIndex++;
+        lineBuffer[recBufferIndex] = '\n';
+        recBufferIndex++;
+        lineBuffer[recBufferIndex] = 0; //zero-termination
+        if (setting.outputGPS) sendData2Client(lineBuffer,recBufferIndex);
+        recBufferIndex = 0;
+        tGpsOk = millis();
+        if (!status.bHasGPS){
+          fanet.setGPS(true);
+          status.bHasGPS = true;
+          log_i("GPS detected --> enable GPS");
+        }
+        
+      }else{
+        if (lineBuffer[recBufferIndex] != '\r'){
+          recBufferIndex++;
+        }
       }
     }  
   }
   if (timeOver(millis(),tGpsOk,10000)){
-    status.bHasGPS = false;
+    if (status.bHasGPS) {
+      fanet.setGPS(false);
+      status.bHasGPS = false;
+      //no GPS for more then 10seconds --> set GPS to false
+      log_i("no GPS detected");
+    }
   }
 }
 #endif
@@ -3763,11 +3880,12 @@ void taskStandard(void *pvParameters){
   fanet.begin(PinLora_SCK, PinLora_MISO, PinLora_MOSI, PinLora_SS,PinLoraRst, PinLoraDI0,frequency,setting.LoraPower,radioChip);
   fanet.setPilotname(setting.PilotName);
   fanet.setAircraftType(setting.AircraftType);
-  //if (setting.Mode == MODE_GROUND_STATION){
-  //  fanet.autobroadcast = false;
-  //}else{
+  fanet.autoSendName = true;
+  if (setting.Mode == MODE_GROUND_STATION){
+    fanet.autobroadcast = false;
+  }else{
     fanet.autobroadcast = true;
-  //}
+  }
   //if (setting.Mode != MODE_DEVELOPER){ //
     
   //}else{
@@ -3780,7 +3898,7 @@ void taskStandard(void *pvParameters){
     flarm.begin();
   }
   #endif
-  if (setting.OGNLiveTracking){
+  if (setting.OGNLiveTracking.mode > 0){
     #ifdef GSMODULE
       if (setting.Mode == MODE_GROUND_STATION){
         ogn.setAirMode(false); //set airmode
@@ -3897,7 +4015,7 @@ void taskStandard(void *pvParameters){
 
     if (setting.bHasFuelSensor) readFuelSensor(tAct);
 
-    if (setting.OGNLiveTracking){
+    if (setting.OGNLiveTracking.mode > 0){
       if (status.vario.bHasVario){
         ogn.setStatusData(status.pressure ,status.varioTemp,NAN,(float)status.vBatt / 1000.,status.BattPerc);
       }else if ((status.vario.bHasBME) || (status.bWUBroadCast)){
@@ -3917,9 +4035,12 @@ void taskStandard(void *pvParameters){
       xSemaphoreGive(xOutputMutex);
       //log_i("sending 2 client %s",s.c_str());
       if (fanetDstId > 0){ //send msg back to dst via fanet
-        //log_i("sending back to %s:%s",fanet.getDevId(fanetDstId),s.c_str()); 
+        log_i("sending back to %s:%s",fanet.getDevId(fanetDstId),s.c_str()); 
+        log_i("updatestate=%d",status.updateState);
         fanet.writeMsgType3(fanetDstId,s);
-        fanetDstId = 0;
+        if (status.updateState != 50){
+          fanetDstId = 0;
+        }        
       }
       char * cstr = new char [s.length()+1];
       strcpy (cstr, s.c_str());      
@@ -3927,11 +4048,11 @@ void taskStandard(void *pvParameters){
       delete cstr; //delete allocated String
     }
 
-    #ifdef AIRMODULE
-    if (setting.Mode == MODE_AIR_MODULE){
-      readGPS();
-    }
-    #endif    
+    //#ifdef AIRMODULE
+    //if (setting.Mode == MODE_AIR_MODULE){
+    readGPS();
+    //}
+    //#endif    
     sendFlarmData(tAct);
     #ifdef OLED
     if (status.displayType == OLED0_96){
@@ -4018,7 +4139,7 @@ void taskStandard(void *pvParameters){
     if (sendWeatherData){ //we have to send weatherdata
       //log_i("sending weatherdata");
       fanet.writeMsgType4(&fanetWeatherData);
-      if (setting.OGNLiveTracking){
+      if (setting.OGNLiveTracking.bits.sendWeather) {
         Ogn::weatherData wData;
         wData.devId = fanet.getMyDevId();
         wData.lat = status.GPS_Lat;
@@ -4070,12 +4191,14 @@ void taskStandard(void *pvParameters){
     }
     FanetLora::nameData nameData;
     if (fanet.getNameData(&nameData)){
-      if (setting.OGNLiveTracking){
+      if (setting.OGNLiveTracking.bits.fwdName){
         ogn.sendNameData(fanet.getDevId(nameData.devId),nameData.name,(float)nameData.snr / 10.0);
       }
     }
     FanetLora::msgData msgData;
     if (fanet.getlastMsgData(&msgData)){
+      status.lastFanetMsg = msgData.msg;
+      status.FanetMsgCount++;
       if (msgData.dstDevId == fanet._myData.devId){
         String sRet = "";
         int pos = getStringValue(msgData.msg,"P","#",0,&sRet);
@@ -4092,7 +4215,7 @@ void taskStandard(void *pvParameters){
     }
     FanetLora::weatherData weatherData;
     if (fanet.getWeatherData(&weatherData)){
-      if (setting.OGNLiveTracking){
+      if (setting.OGNLiveTracking.bits.fwdWeather){
         Ogn::weatherData wData;
         wData.devId = fanet.getDevId(weatherData.devId);
         wData.lat = weatherData.lat;
@@ -4120,16 +4243,26 @@ void taskStandard(void *pvParameters){
     if (fanet.getTrackingData(&tFanetData)){
       //log_i("new Tracking-Data");
       if (tFanetData.type == 0x11){ //online-tracking
-        if (setting.OGNLiveTracking){
+        if (setting.OGNLiveTracking.bits.liveTracking){
           ogn.sendTrackingData(tFanetData.timestamp ,tFanetData.lat ,tFanetData.lon,tFanetData.altitude,tFanetData.speed,tFanetData.heading,tFanetData.climb,fanet.getDevId(tFanetData.devId) ,(Ogn::aircraft_t)fanet.getFlarmAircraftType(&tFanetData),tFanetData.addressType,tFanetData.OnlineTracking,(float)tFanetData.snr);
         } 
         sendAWTrackingdata(&tFanetData);
         sendTraccarTrackingdata(&tFanetData);
       }else if (tFanetData.type >= 0x70){ //ground-tracking
-        if (setting.OGNLiveTracking){
+        if (setting.OGNLiveTracking.bits.liveTracking){
           ogn.sendGroundTrackingData(tFanetData.timestamp,tFanetData.lat,tFanetData.lon,fanet.getDevId(tFanetData.devId),tFanetData.type,tFanetData.addressType,(float)tFanetData.snr);
         } 
       }
+      #ifdef SENDFLARMDIRECT
+      FlarmtrackingData myFlarmData;
+      FlarmtrackingData PilotFlarmData;
+      Fanet2FlarmData(&fanet._myData,&myFlarmData);
+      Fanet2FlarmData(&tFanetData,&PilotFlarmData);
+      char sOut[MAXSTRING];
+      int pos = flarm.writeFlarmData(sOut,MAXSTRING,&myFlarmData,&PilotFlarmData);
+      sendData2Client(sOut,pos);
+      flarmCount++;
+      #endif
     }    
     flarm.run();
     if (setting.outputModeVario == OVARIO_LK8EX1) sendLK8EX(tAct);
@@ -4181,7 +4314,12 @@ void taskStandard(void *pvParameters){
           MyFanetData.lon = status.GPS_Lon;
           MyFanetData.altitude = status.GPS_alt;
           //log_i("lat=%.6f;lon=%.6f;alt=%.1f;geoAlt=%.1f",status.GPS_Lat,status.GPS_Lon,status.GPS_alt,geoidalt/1000.);
-          MyFanetData.speed = status.GPS_speed; //speed in cm/s --> we need km/h
+          if (fanet.onGround){
+            MyFanetData.speed = 0.0;
+          }else{
+            MyFanetData.speed = status.GPS_speed; //speed in cm/s --> we need km/h
+            if (MyFanetData.speed < 1.0) MyFanetData.speed = 1.0;
+          }
           MyFanetData.addressType = ADDRESSTYPE_OGN;
           if ((status.GPS_speed <= 5.0) && (status.vario.bHasVario)){
             MyFanetData.heading = status.varioHeading;
@@ -4189,7 +4327,7 @@ void taskStandard(void *pvParameters){
             MyFanetData.heading = status.GPS_course;
           }
           MyFanetData.aircraftType = fanet.getAircraftType();        
-          if (setting.OGNLiveTracking){
+          if (setting.OGNLiveTracking.bits.liveTracking){
             ogn.setGPS(status.GPS_Lat,status.GPS_Lon,status.GPS_alt,status.GPS_speed,MyFanetData.heading);
             if (fanet.onGround){
               ogn.sendGroundTrackingData(now(),status.GPS_Lat,status.GPS_Lon,fanet.getDevId(tFanetData.devId),fanet.state,MyFanetData.addressType,0.0);
@@ -4226,6 +4364,28 @@ void taskStandard(void *pvParameters){
         status.GPS_course = 0.0;
         status.GPS_NumSat = 0;
       }
+    }else{
+      if (!status.bHasGPS){
+        if ((tAct - tOldPPS) >= 1000){
+          ppsMillis = millis();
+          ppsTriggered = true;
+          
+        }
+      }
+      if (ppsTriggered){
+        ppsTriggered = false;
+        tOldPPS = tAct;
+        MyFanetData.climb = status.ClimbRate;
+        MyFanetData.lat = status.GPS_Lat;
+        MyFanetData.lon = status.GPS_Lon;
+        MyFanetData.altitude = status.GPS_alt;
+        MyFanetData.speed = 0; //speed in cm/s --> we need km/h
+        MyFanetData.addressType = ADDRESSTYPE_OGN;
+        MyFanetData.heading = 0;
+        MyFanetData.aircraftType = fanet.getAircraftType();        
+        fanet.setMyTrackingData(&MyFanetData,status.GPS_geoidAlt,ppsMillis); //set Data on fanet
+
+      }
     }
     #endif
 
@@ -4249,7 +4409,8 @@ void taskStandard(void *pvParameters){
     }
 
     delay(1);
-    if ((WebUpdateRunning) || (bPowerOff)) break;
+    //if ((WebUpdateRunning) || (bPowerOff)) break;
+    if (bPowerOff) break;
   }
   log_i("stop task");
   #ifdef OLED
@@ -4266,7 +4427,7 @@ void taskStandard(void *pvParameters){
   }
   #endif
   fanet.end();
-  if (setting.OGNLiveTracking) ogn.end();
+  if (setting.OGNLiveTracking.mode > 0) ogn.end();
   vTaskDelete(xHandleStandard); //delete standard-task
 }
 
@@ -4447,6 +4608,30 @@ void handleUpdate(uint32_t tAct){
         status.updateState = 10; //we can update --> newer Version
       }
     }
+  }else if (status.updateState == 50){ //autoupdate via FANET !!
+    if (updater.checkVersion()){
+      status.sNewVersion = updater.getVersion();
+      if (updater.checkVersionNewer()){
+        add2OutputString("update to " + status.sNewVersion + "\r\n");
+        WebUpdateRunning = true;
+        delay(500); //wait 1 second until tasks are stopped
+        if (updater.updateVersion()){ //update to newest version  
+          add2OutputString("update complete\r\n");
+          status.updateState = 60;
+          status.tRestart = millis();
+        }else{
+          add2OutputString("update failed\r\n");
+          status.updateState = 60;
+          status.tRestart = millis();
+        }
+      }else{
+        add2OutputString("no new Version avaiable\r\n");
+        status.updateState = 60;
+      }
+    }else{
+      add2OutputString("no connection to server\r\n");
+      status.updateState = 60;
+    }
   }else if (status.updateState == 100){
     status.updateState = 110;
     WebUpdateRunning = true;
@@ -4461,6 +4646,89 @@ void handleUpdate(uint32_t tAct){
     
   }
 }
+
+#ifdef GSM_MODULE
+
+/*
+void sendStatus(){
+  //modem.sendAT(GF("+CMGS=\"","06509946563")); //Number for sending SMS
+  log_i("send status");
+  String sStatus = "WDIR=" + String(status.weather.WindDir,1) + "\r\nWSPEED=" + String(status.weather.WindSpeed,1) + "\r\nWGUST=" + String(status.weather.WindGust,1) + "\r\nTEMP=" + String(status.weather.temp,1) + "\r\nPRESS=" + String(status.weather.Pressure,1);
+  if (!modem.sendSMS("00436769440910",sStatus.c_str())){
+    log_i("error sending SMS");
+  }
+
+}
+
+void readSMS(){
+  //log_i("read SMS");
+  xSemaphoreTake( xGsmMutex, portMAX_DELAY );
+  //log_i("check SMS");
+  String data;
+  //modem.sendAT(GF("+CMGL=\"REC UNREAD\""));  //don't change status of SMS
+  uint8_t NewSms = 0;
+  uint8_t index;
+  GsmSerial.setTimeout(5000);
+  modem.sendAT(GF("+CMGL=\"ALL\""));  //don't change status of SMS
+  String Text = "";
+  String sNumber = "";
+  int32_t pos = 0;
+  while(1) {
+    data = modem.stream.readStringUntil('\n');
+    pos = data.indexOf('\r');
+    if (pos >= 0){
+      //log_i("cr found");
+      data.replace("\r","");
+    } 
+    String sRet = "";
+    pos = getStringValue(data,String("+CMGL: "),String(",\""),0,&sRet);
+    if (pos >= 0){     
+     if (NewSms == 0){
+      index = atoi(sRet.c_str());
+      pos += 3;
+      log_i("pos=%d",pos);
+      pos = getStringValue(data,String("\",\""),String("\""),pos,&sNumber);
+      if (pos >= 0){
+        log_i("index=%d,number=%s",index,sNumber.c_str());
+      }      
+      NewSms = 1; //new SMS received
+      Text = ""; //clear Text
+     }else{
+       NewSms = 2;
+     }
+    }else{
+      if (NewSms == 1){
+        Text = data;
+        NewSms = 2;
+      }
+    }
+
+    log_i("%s",data.c_str());
+    if (data.length() <= 0){
+      break;
+    }
+  }
+  if (NewSms > 0){
+    log_i("SMS=%s",Text.c_str());
+    if (Text == "status"){
+      //send status
+      sendStatus();      
+    }else if (Text == "update"){
+      //do online update !!
+      log_i("do update");
+    }
+
+    
+    //delete SMS
+    log_i("delete SMS %d",index);
+    modem.sendAT(GF("+CMGD="), index); //delete SMS
+    modem.waitResponse();
+  }
+  GsmSerial.setTimeout(1000);
+  xSemaphoreGive( xGsmMutex );
+}
+*/
+#endif
 
 void taskBackGround(void *pvParameters){
   static uint32_t tWifiCheck = millis();
@@ -4498,7 +4766,7 @@ void taskBackGround(void *pvParameters){
       Web_loop();
     }
     handleUpdate(tAct);
-    #ifdef GSMODULE
+    #ifdef GSMODULE    
     if (setting.Mode == MODE_GROUND_STATION){
       if (status.bTimeOk == true){
         if (day() != actDay){
@@ -4565,7 +4833,7 @@ void taskBackGround(void *pvParameters){
         adjustTime(0);
         struct tm timeinfo;
         if(getLocalTime(&timeinfo)){
-          //log_i("h=%d,min=%d,sec=%d,day=%d,month=%d,year=%d",timeinfo.tm_hour,timeinfo.tm_min, timeinfo.tm_sec, timeinfo.tm_mday,timeinfo.tm_mon+1, timeinfo.tm_year + 1900);
+          log_i("h=%d,min=%d,sec=%d,day=%d,month=%d,year=%d",timeinfo.tm_hour,timeinfo.tm_min, timeinfo.tm_sec, timeinfo.tm_mday,timeinfo.tm_mon+1, timeinfo.tm_year + 1900);
           setAllTime(timeinfo);
           struct tm now;
           getLocalTime(&now,0);
@@ -4599,7 +4867,7 @@ void taskBackGround(void *pvParameters){
           xSemaphoreTake( xGsmMutex, portMAX_DELAY );
           bool bret = modem.getNetworkTime(&year3, &month3, &day3, &hour3, &min3, &sec3,&timezone);
           xSemaphoreGive( xGsmMutex );
-          log_i("h=%d,min=%d,sec=%d,day=%d,month=%d,year=%d,ret=%d",hour3,min3, sec3, day3,month3, year3,bret);
+          //log_i("h=%d,min=%d,sec=%d,day=%d,month=%d,year=%d,ret=%d",hour3,min3, sec3, day3,month3, year3,bret);
           if (bret){
             //log_i("set time");
             adjustTime(0);

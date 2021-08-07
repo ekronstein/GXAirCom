@@ -165,8 +165,13 @@ SCL 14
 
 #define APPNAME "GXAirCom"
 
+//#define SENDFLARMDIRECT //send Flarm-msg, when received
+
 #define BLE_LOW_HEAP 10000
 #define MAX_BLE_LOW_HEAP_TIME 30000
+
+#define GSM_CHECK_TIME_CON 60000
+#define GSM_CHECK_TIME_SMS 5000
 
 #define OLED_SLAVE_ADDRESS (0x3C)
 
@@ -351,6 +356,7 @@ struct GsmSettings{
   String apn;
   String user;
   String pwd;
+  uint8_t NetworkMode;
 };
 
 struct WifiSettings{
@@ -361,6 +367,15 @@ struct WifiSettings{
   uint32_t tWifiStop; //time after wifi will be stopped to save energy 0 --> never
 };
 
+	struct OgnModeBits
+	{
+			unsigned liveTracking:1, sendWeather:1, fwdWeather:1, fwdName:1, b4:1, b5:1, b6:1, b7:1;
+	};
+	union uOgnMode
+	{
+			OgnModeBits bits;
+			uint8_t mode;
+	};
 
 
 struct SettingsData{
@@ -386,7 +401,7 @@ struct SettingsData{
   uint8_t outputMode; //output-mode
   GSSettings gs;
   VarioSettings vario; //variosettings
-  uint8_t OGNLiveTracking; //OGN-Live-Tracking
+  uOgnMode OGNLiveTracking; //OGN-Live-Tracking
   uint8_t screenNumber; //number of default-screen
   uint8_t RFMode; //RF-Mode
   uint8_t traccarLiveTracking; //Traccar live-tracking
@@ -416,6 +431,13 @@ struct commandData{
   uint8_t ConfigGPS; //command to configure GPS
   uint8_t CalibAcc;  //command calibrate acc
   uint8_t CalibGyro; //command calibrate Gyro
+};
+
+struct gsmStatus{
+  bool bHasGSM;
+  int16_t SignalQuality; //signalquality
+  int16_t networkstat; //networkstatus
+  String sOperator; //Operator
 };
 
 struct statusData{
@@ -458,8 +480,7 @@ struct statusData{
   uint8_t modemstatus; //status of mobile-device (sim800)
   bool bInternetConnected;
   bool bTimeOk;
-  bool bHasGSM;
-  int16_t GSMSignalQuality;
+  gsmStatus gsm;
   uint8_t displayStat; //stat of display
   bool bHasGPS;
   uint8_t updateState; //state of update
@@ -467,6 +488,8 @@ struct statusData{
   uint32_t tRestart;
   float fuelSensor; //ads of fuel-sensor
   uint8_t calibAccStat;
+  uint8_t FanetMsgCount;
+  String lastFanetMsg;
 };
 
 #endif
